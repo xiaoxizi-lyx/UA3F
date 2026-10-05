@@ -1,0 +1,402 @@
+# 同步上游 + 编译体积最小化的 arm64 OpenWrt apk 包并发布 Release
+#
+# 流程：
+#   1. sync          ：拉取上游，若有新提交则把本仓库的自定义提交 rebase 到上游之上并强推；
+#                      若上游无更新且对应 Release 已存在则直接结束（手动运行可勾选强制编译）
+#   2. build-binary  ：CGO_ENABLED=0 静态编译 linux/arm64，-trimpath -s -w -buildid=，再 upx --lzma --best
+#   3. verify-binary ：在原生 arm64 runner 上实际运行压缩后的二进制（与 package 并行）
+#   4. package       ：用 OpenWrt SDK 把第 2 步的二进制打包为 apk（跳过 SDK 内的 Go 编译和 strip）
+#   5. release       ：verify-binary 和 package 都通过后发布到 GitHub Release
+#
+# 需要的 Secret：
+#   SYNC_TOKEN —— 一个对本仓库有 Contents: Read and write + Workflows: Read and write 权限的
+#                 Fine-grained PAT。rebase 后的提交包含 .github/workflows 下的文件，
+#                 默认的 GITHUB_TOKEN 无权推送这类提交。
+#
+# 可选的 Repository variables（Settings → Secrets and variables → Actions → Variables）：
+#   OPENWRT_ARCHES       —— JSON 数组，覆盖要打包的架构（默认只打包 aarch64_cortex-a53），
+#                           如 ["aarch64_generic","aarch64_cortex-a53"]
+#   OPENWRT_SDK_VERSION  —— 覆盖 OpenWrt SDK 版本，如 25.12.2（默认取上游 release.yml 里最新的 25.x+ 版本）
+
+name: Sync Upstream & Build arm64 APK (size-optimized)
+
+on:
+  workflow_dispatch:
+    inputs:
+      force_build:
+        description: "上游无更新时也强制编译发布"
+        type: boolean
+        default: false
+  schedule:
+    - cron: "0 20 * * *" # 每天 UTC 20:00（北京时间 04:00）
+
+permissions:
+  contents: write
+  actions: write # 用于每次运行时重新启用本 workflow，刷新 60 天无活动自动停用的计时
+
+concurrency:
+  group: ${{ github.workflow }}
+  cancel-in-progress: false
+
+env:
+  UPSTREAM_REPO: SunBK201/UA3F
+  UPSTREAM_BRANCH: master
+  UPX_VERSION: 5.2.1
+
+jobs:
+  sync:
+    name: Sync with upstream
+    runs-on: ubuntu-latest
+    outputs:
+      build: ${{ steps.decide.outputs.build }}
+      sha: ${{ steps.decide.outputs.sha }}
+      upstream_sha: ${{ steps.decide.outputs.upstream_sha }}
+      version: ${{ steps.decide.outputs.version }}
+      tag: ${{ steps.decide.outputs.tag }}
+      go_version: ${{ steps.decide.outputs.go_version }}
+      sdk_version: ${{ steps.decide.outputs.sdk_version }}
+
+    steps:
+      # GitHub 会在仓库 60 天没有活动后停用定时任务；每次运行都调用一次 enable 接口来刷新计时
+      - name: Keep scheduled workflow alive
+        continue-on-error: true
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          WORKFLOW_FILE=$(basename "${GITHUB_WORKFLOW_REF%@*}")
+          gh api -X PUT "repos/${GITHUB_REPOSITORY}/actions/workflows/${WORKFLOW_FILE}/enable"
+          echo "已重新启用 ${WORKFLOW_FILE}"
+
+      - uses: actions/checkout@v5
+        with:
+          ref: ${{ github.ref_name }}
+          fetch-depth: 0
+          token: ${{ secrets.SYNC_TOKEN || github.token }}
+
+      - name: Rebase onto upstream
+        id: rebase
+        env:
+          BRANCH: ${{ github.ref_name }}
+          HAS_SYNC_TOKEN: ${{ secrets.SYNC_TOKEN != '' }}
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+
+          git remote add upstream "https://github.com/${UPSTREAM_REPO}.git"
+          git fetch --no-tags upstream "${UPSTREAM_BRANCH}"
+          UPSTREAM_REF="upstream/${UPSTREAM_BRANCH}"
+
+          if git merge-base --is-ancestor "$UPSTREAM_REF" HEAD; then
+            echo "上游没有新提交（$(git rev-parse --short "$UPSTREAM_REF")）"
+            echo "updated=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          echo "上游新提交："
+          git log --oneline "HEAD..$UPSTREAM_REF"
+
+          if [ "$HAS_SYNC_TOKEN" != "true" ]; then
+            echo "::error::未配置 SYNC_TOKEN，GITHUB_TOKEN 无法推送包含 workflow 文件的提交，请按文件头注释配置。"
+            exit 1
+          fi
+
+          OLD_HEAD=$(git rev-parse HEAD)
+          if ! git rebase "$UPSTREAM_REF"; then
+            git rebase --abort
+            echo "::error::rebase 冲突，请在本地手动 rebase 到 ${UPSTREAM_REPO}@${UPSTREAM_BRANCH} 并解决冲突后推送。"
+            exit 1
+          fi
+
+          git push --force-with-lease="refs/heads/${BRANCH}:${OLD_HEAD}" origin "HEAD:refs/heads/${BRANCH}"
+          echo "updated=true" >> "$GITHUB_OUTPUT"
+
+      - name: Decide whether to build
+        id: decide
+        env:
+          GH_TOKEN: ${{ github.token }}
+          UPDATED: ${{ steps.rebase.outputs.updated }}
+          FORCE: ${{ inputs.force_build || false }}
+          SDK_VERSION_OVERRIDE: ${{ vars.OPENWRT_SDK_VERSION }}
+        run: |
+          UPSTREAM_SHA=$(git rev-parse "upstream/${UPSTREAM_BRANCH}")
+          VERSION=$(sed -n 's/^PKG_VERSION:=//p' openwrt/Makefile)
+          # 不以 v 开头，避免触发上游 release.yml / docker.yaml 的 tags: v* 规则
+          TAG="mini-${VERSION}-${UPSTREAM_SHA:0:7}"
+
+          GO_VERSION=$(sed -n 's/^go \([0-9]*\.[0-9]*\).*/\1/p' go.mod)
+
+          SDK_VERSION="$SDK_VERSION_OVERRIDE"
+          if [ -z "$SDK_VERSION" ]; then
+            # 25.x 起 OpenWrt 使用 apk 包管理器，取上游 release.yml 中最新的版本
+            SDK_VERSION=$(grep -oE '\b(2[5-9]|[3-9][0-9])\.[0-9]+\.[0-9]+\b' .github/workflows/release.yml | sort -uV | tail -n1 || true)
+          fi
+          SDK_VERSION="${SDK_VERSION:-25.12.2}"
+
+          BUILD=false
+          if [ "$UPDATED" = "true" ] || [ "$FORCE" = "true" ]; then
+            BUILD=true
+          elif ! gh release view "$TAG" --repo "$GITHUB_REPOSITORY" > /dev/null 2>&1; then
+            echo "上游无更新，但尚未发布 $TAG（首次运行或上次编译失败），继续编译"
+            BUILD=true
+          fi
+
+          {
+            echo "build=$BUILD"
+            echo "sha=$(git rev-parse HEAD)"
+            echo "upstream_sha=$UPSTREAM_SHA"
+            echo "version=$VERSION"
+            echo "tag=$TAG"
+            echo "go_version=$GO_VERSION"
+            echo "sdk_version=$SDK_VERSION"
+          } | tee -a "$GITHUB_OUTPUT"
+
+          if [ "$BUILD" != "true" ]; then
+            echo "### 上游无更新，跳过编译" >> "$GITHUB_STEP_SUMMARY"
+          fi
+
+  build-binary:
+    name: Build linux/arm64 binary
+    needs: sync
+    if: needs.sync.outputs.build == 'true'
+    runs-on: ubuntu-latest
+    outputs:
+      raw_size: ${{ steps.build.outputs.raw_size }}
+      stripped_size: ${{ steps.build.outputs.stripped_size }}
+      upx_size: ${{ steps.build.outputs.upx_size }}
+
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          ref: ${{ needs.sync.outputs.sha }}
+
+      - name: Install dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y llvm clang linux-headers-$(uname -r) libbpf-dev gcc-multilib
+
+      - name: Install UPX
+        run: |
+          curl -fsSL "https://github.com/upx/upx/releases/download/v${UPX_VERSION}/upx-${UPX_VERSION}-amd64_linux.tar.xz" \
+            | tar -xJ -C "$RUNNER_TEMP"
+          echo "$RUNNER_TEMP/upx-${UPX_VERSION}-amd64_linux" >> "$GITHUB_PATH"
+
+      - name: Set up Go
+        uses: actions/setup-go@v6
+        with:
+          go-version: ${{ needs.sync.outputs.go_version }}
+          cache-dependency-path: go.sum
+
+      - name: Generate BPF code
+        run: go generate ./internal/bpf/...
+
+      - name: Build and compress
+        id: build
+        env:
+          APP_VERSION: v${{ needs.sync.outputs.version }}
+        run: |
+          export CGO_ENABLED=0 GOOS=linux GOARCH=arm64
+
+          # 仅用于对比体积：默认参数编译
+          go build -o ua3f.raw -ldflags "-X main.appVersion=${APP_VERSION}" .
+
+          # 体积最小化编译：去掉路径、符号表、DWARF、build id 和 VCS 信息
+          go build -trimpath -buildvcs=false \
+            -ldflags "-s -w -buildid= -X main.appVersion=${APP_VERSION}" \
+            -o ua3f .
+          cp ua3f ua3f.stripped
+
+          upx --lzma --best ua3f
+          upx -t ua3f
+
+          {
+            echo "raw_size=$(stat -c %s ua3f.raw)"
+            echo "stripped_size=$(stat -c %s ua3f.stripped)"
+            echo "upx_size=$(stat -c %s ua3f)"
+          } | tee -a "$GITHUB_OUTPUT"
+
+      - name: Upload binary
+        uses: actions/upload-artifact@v7
+        with:
+          name: ua3f-linux-arm64
+          path: ua3f
+          retention-days: 1
+
+  # x86 runner 无法直接运行 arm64 程序，所以单独申请一台原生 arm64 runner 来验证
+  # （arm64 runner 仅对公开仓库免费）
+  verify-binary:
+    name: Verify binary on arm64
+    needs: [sync, build-binary]
+    runs-on: ubuntu-24.04-arm
+    timeout-minutes: 10
+
+    steps:
+      - name: Download binary
+        uses: actions/download-artifact@v8
+        with:
+          name: ua3f-linux-arm64
+
+      - name: Run compressed binary
+        env:
+          APP_VERSION: v${{ needs.sync.outputs.version }}
+        run: |
+          ARCH=$(uname -m)
+          [ "$ARCH" = "aarch64" ] || { echo "::error::runner 架构是 $ARCH，不是 aarch64"; exit 1; }
+
+          chmod +x ua3f
+          OUT=$(./ua3f -v)
+          echo "$OUT"
+          echo "$OUT" | grep -qF "$APP_VERSION"
+
+  package:
+    name: Package ${{ matrix.arch }}
+    needs: [sync, build-binary]
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: true
+      matrix:
+        arch: ${{ fromJSON(vars.OPENWRT_ARCHES || '["aarch64_cortex-a53"]') }}
+
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          ref: ${{ needs.sync.outputs.sha }}
+
+      - name: Download binary
+        uses: actions/download-artifact@v8
+        with:
+          name: ua3f-linux-arm64
+          path: prebuilt
+
+      # 改写（仅在 CI 工作区内）openwrt/Makefile：
+      # 用上一步的 UPX 二进制代替 SDK 内的 Go 编译，并关闭 strip（strip 会破坏 UPX 压缩后的文件）
+      - name: Patch OpenWrt Makefile to use prebuilt binary
+        env:
+          MK: openwrt/Makefile
+          PKG_RELEASE: ${{ github.run_number }}
+        run: |
+          mv prebuilt/ua3f openwrt/ua3f.prebuilt
+
+          for pattern in \
+            '^include $(TOPDIR)/feeds/packages/lang/golang/golang-package.mk' \
+            '$(GO_PKG_BUILD_BIN_DIR)/ua3f' \
+            '^PKG_RELEASE:=' \
+            '^PKG_BUILD_DEPENDS:=golang/host'; do
+            grep -qF "${pattern#^}" "$MK" || { echo "::error::上游 openwrt/Makefile 结构已变化，找不到: $pattern"; exit 1; }
+          done
+
+          # 不再需要在 SDK 里编译 Go 工具链；用 run_number 作为 release 号，保证 apk 能正常升级
+          sed -i \
+            -e 's|^PKG_BUILD_DEPENDS:=golang/host.*|PKG_BUILD_DEPENDS:=|' \
+            -e "s|^PKG_RELEASE:=.*|PKG_RELEASE:=${PKG_RELEASE}|" \
+            "$MK"
+
+          {
+            echo ''
+            echo '# >>> injected by sync-build-arm64.yml'
+            echo 'STRIP:=:'
+            echo 'RSTRIP:=:'
+            echo 'define Build/Configure'
+            echo 'endef'
+            # Configure 被跳过后没有 Go 源码树，InstallDev（把 Go 源码装进 staging 供其他包引用）也必须跳过
+            echo 'define Build/InstallDev'
+            echo 'endef'
+            echo 'define Build/Compile'
+            printf '\t%s\n' '$(INSTALL_DIR) $(GO_PKG_BUILD_BIN_DIR)'
+            printf '\t%s\n' '$(INSTALL_BIN) $(CURDIR)/ua3f.prebuilt $(GO_PKG_BUILD_BIN_DIR)/ua3f'
+            echo 'endef'
+            echo '# <<< injected by sync-build-arm64.yml'
+          } > "$RUNNER_TEMP/inject.mk"
+
+          sed -i "\|^include \$(TOPDIR)/feeds/packages/lang/golang/golang-package.mk|r $RUNNER_TEMP/inject.mk" "$MK"
+          cat "$MK"
+
+      - name: Build package
+        uses: openwrt/gh-action-sdk@v11
+        env:
+          ARCH: ${{ matrix.arch }}-${{ needs.sync.outputs.sdk_version }}
+          FEEDNAME: ua3f_ci
+          PACKAGES: openwrt
+
+      # SDK 默认安静编译，失败时只显示 "failed to build"；详细日志在 logs/ 下，
+      # 这里把它打印出来，并把末尾写成错误注解（注解可通过公开 API 读取）
+      - name: Show package build log on failure
+        if: failure()
+        run: |
+          LOG_DIR=logs/package/feeds/ua3f_ci/openwrt
+          [ -d "$LOG_DIR" ] || { echo "未找到 $LOG_DIR"; ls -R logs 2>/dev/null | head -50; exit 0; }
+          for f in "$LOG_DIR"/*.txt; do
+            echo "::group::$f"
+            cat "$f"
+            echo "::endgroup::"
+          done
+          LAST=$(ls -t "$LOG_DIR"/*.txt | head -n1)
+          MSG=$(tail -n 40 "$LAST" | sed -e 's/%/%25/g' -e 's/\r/%0D/g' | sed ':a;N;$!ba;s/\n/%0A/g')
+          echo "::error title=OpenWrt package build failed ($(basename "$LAST"))::$MSG"
+
+      - name: Rename package with arch suffix
+        run: |
+          cd bin/packages/${{ matrix.arch }}/ua3f_ci/
+          ls -l
+          for f in *.apk; do mv "$f" "${f%.apk}-${{ matrix.arch }}.apk"; done
+          ls -l
+
+      - name: Upload package
+        uses: actions/upload-artifact@v7
+        with:
+          name: package-${{ matrix.arch }}
+          path: bin/packages/${{ matrix.arch }}/ua3f_ci/*.apk
+          if-no-files-found: error
+          retention-days: 1
+
+  release:
+    name: Release
+    needs: [sync, build-binary, verify-binary, package]
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Download packages
+        uses: actions/download-artifact@v8
+        with:
+          pattern: package-*
+          path: dist/
+          merge-multiple: true
+
+      - name: Write release notes
+        env:
+          UPSTREAM_SHA: ${{ needs.sync.outputs.upstream_sha }}
+          SDK_VERSION: ${{ needs.sync.outputs.sdk_version }}
+          RAW: ${{ needs.build-binary.outputs.raw_size }}
+          STRIPPED: ${{ needs.build-binary.outputs.stripped_size }}
+          UPX: ${{ needs.build-binary.outputs.upx_size }}
+        run: |
+          h() { numfmt --to=iec-i --suffix=B --format='%.2f' "$1"; }
+          cat > notes.md <<EOF
+          基于上游 [${UPSTREAM_REPO}@${UPSTREAM_SHA:0:7}](https://github.com/${UPSTREAM_REPO}/commit/${UPSTREAM_SHA})，OpenWrt SDK ${SDK_VERSION}（apk 包管理器）。
+
+          | ua3f 二进制 | 大小 |
+          | --- | --- |
+          | 默认编译 | $(h "$RAW") |
+          | \`-trimpath -ldflags "-s -w -buildid="\` | $(h "$STRIPPED") |
+          | \`upx --lzma --best\` | $(h "$UPX") |
+
+          在路由器上执行 \`apk --print-arch\` 确认架构后，下载对应文件安装：
+
+          \`\`\`sh
+          apk add --allow-untrusted ./ua3f-*-<arch>.apk
+          \`\`\`
+          EOF
+          cat notes.md
+          ls -l dist/
+
+      - name: Publish release
+        uses: softprops/action-gh-release@v3
+        with:
+          tag_name: ${{ needs.sync.outputs.tag }}
+          target_commitish: ${{ needs.sync.outputs.sha }}
+          name: UA3F v${{ needs.sync.outputs.version }} (${{ needs.sync.outputs.tag }}) arm64
+          body_path: notes.md
+          files: dist/*.apk
+          draft: false
+          prerelease: false
+          make_latest: true
+          token: ${{ github.token }}
